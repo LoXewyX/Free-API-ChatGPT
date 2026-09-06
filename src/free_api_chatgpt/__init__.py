@@ -39,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="Disable SQLite persistence and database action round-trips.",
+    )
+
+    parser.add_argument(
         "--headed",
         action="store_true",
         help="Run Firefox with a visible window.",
@@ -65,6 +71,7 @@ def main():
         profile_dir=args.profile_dir,
         context=args.context,
         headless=(True if args.headless else False if args.headed else HEADLESS),
+        db_enabled=not args.no_db,
     )
 
     import uvicorn

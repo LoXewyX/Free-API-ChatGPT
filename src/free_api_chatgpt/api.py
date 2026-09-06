@@ -1,21 +1,23 @@
+import asyncio
 import json
 import sqlite3
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from html import escape
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from playwright.async_api import (
-    TimeoutError as PlaywrightTimeoutError,
-)
+from fastapi.responses import HTMLResponse, StreamingResponse
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel
 
 from .browser import BrowserManager
 from .chatgpt import ChatGPT
 from .config import (
+    DB_ENABLED,
     INTERNAL_CONTEXT,
+    NO_DB_INTERNAL_CONTEXT,
     get_local_timezone,
 )
 from .db import Database
@@ -36,12 +38,13 @@ def database_context() -> str:
 
 
 def build_internal_context() -> str:
+    if not DB_ENABLED:
+        return NO_DB_INTERNAL_CONTEXT
+
     return INTERNAL_CONTEXT + "\n\nCURRENT DATABASE STATE:\n" + database_context()
 
 
-def local_to_utc(
-    value: str,
-) -> str:
+def local_to_utc(value: str) -> str:
     timezone = ZoneInfo(get_local_timezone())
 
     local_datetime = datetime.strptime(
@@ -53,7 +56,9 @@ def local_to_utc(
 
     utc_datetime = local_datetime.astimezone(UTC)
 
-    return utc_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    return utc_datetime.strftime(
+        "%Y-%m-%d %H:%M:%S",
+    )
 
 
 def extract_header_body(
@@ -147,7 +152,9 @@ def execute_database_action(
 
         return {
             "action": action_name,
-            "result": database.get_entry(entry_id),
+            "result": database.get_entry(
+                entry_id,
+            ),
         }
 
     if action_name == "create_entry":
@@ -227,7 +234,9 @@ def execute_database_action(
 
         return {
             "action": action_name,
-            "result": database.delete_entry(entry_id),
+            "result": database.delete_entry(
+                entry_id,
+            ),
         }
 
     if action_name == "list_history":
@@ -265,10 +274,14 @@ def execute_database_action(
             raise TypeError("limit must be an integer.")
 
         if created_after is not None:
-            created_after = local_to_utc(created_after)
+            created_after = local_to_utc(
+                created_after,
+            )
 
         if created_before is not None:
-            created_before = local_to_utc(created_before)
+            created_before = local_to_utc(
+                created_before,
+            )
 
         print(
             "HISTORY LOCAL → UTC:",
@@ -296,7 +309,9 @@ def execute_database_action(
 
         return {
             "action": action_name,
-            "result": database.get_history(history_id),
+            "result": database.get_history(
+                history_id,
+            ),
         }
 
     if action_name == "update_history":
@@ -362,7 +377,9 @@ def execute_database_action(
 
         return {
             "action": action_name,
-            "result": database.delete_history(history_id),
+            "result": database.delete_history(
+                history_id,
+            ),
         }
 
     raise ValueError(f"Unsupported database action: {action_name}")
@@ -372,6 +389,16 @@ async def process_chat(
     chatgpt: ChatGPT,
     message: str,
 ) -> str:
+    """
+    NORMAL /chat path.
+
+    IMPORTANT:
+    This function NEVER calls ask_stream().
+    """
+
+    if not DB_ENABLED:
+        return (await chatgpt.ask(message)).strip()
+
     prompt = message
 
     for round_number in range(10):
@@ -381,7 +408,9 @@ async def process_chat(
         print(response)
         print("--- END DATABASE ROUND ---\n")
 
-        header, body = extract_header_body(response)
+        header, body = extract_header_body(
+            response,
+        )
 
         actions = header["actions"]
 
@@ -430,22 +459,122 @@ async def process_chat(
     raise RuntimeError("Maximum database action rounds exceeded.")
 
 
+async def process_chat_stream(
+    chatgpt: ChatGPT,
+    message: str,
+) -> AsyncIterator[str]:
+    """
+    /chat/stream path.
+
+    IMPORTANT:
+    This function is the ONLY normal application path
+    that calls ask_stream().
+    """
+
+    if not DB_ENABLED:
+        async for chunk in chatgpt.ask_stream(message):
+            if chunk:
+                yield chunk
+
+        return
+
+    prompt = message
+
+    for round_number in range(10):
+        parts: list[str] = []
+
+        async for chunk in chatgpt.ask_stream(prompt):
+            parts.append(chunk)
+
+        response = "".join(parts).strip()
+
+        print(f"\n--- STREAM DATABASE ROUND {round_number + 1} ---")
+        print(response)
+        print("--- END DATABASE ROUND ---\n")
+
+        header, body = extract_header_body(
+            response,
+        )
+
+        actions = header["actions"]
+
+        print("DATABASE ACTIONS:")
+        print(
+            json.dumps(
+                actions,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
+        if not actions:
+            database.log_interaction(
+                message=message,
+                response=body,
+            )
+
+            chunk_size = 40
+
+            for index in range(
+                0,
+                len(body),
+                chunk_size,
+            ):
+                yield body[index : index + chunk_size]
+
+                await asyncio.sleep(0)
+
+            return
+
+        results = [execute_database_action(action) for action in actions]
+
+        print("DATABASE RESULTS:")
+        print(
+            json.dumps(
+                results,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
+
+        prompt = (
+            "DATABASE ACTION RESULTS:\n"
+            + json.dumps(
+                results,
+                ensure_ascii=False,
+            )
+            + "\n\n"
+            "Use these results to answer the user's "
+            "original request.\n"
+            "Return exactly the required HEADER and "
+            "BODY format."
+        )
+
+    raise RuntimeError("Maximum database action rounds exceeded.")
+
+
 async def initialize_chatgpt_context(
     chatgpt: ChatGPT,
 ):
-    await chatgpt.initialize_context(build_internal_context())
+    await chatgpt.initialize_context(
+        build_internal_context(),
+    )
 
 
 @asynccontextmanager
 async def lifespan(
     app: FastAPI,
 ):
-    database.initialize()
+    if DB_ENABLED:
+        database.initialize()
 
     page = await browser.start()
+
     chatgpt = ChatGPT(page)
 
     await chatgpt.initialize_page()
+
     await initialize_chatgpt_context(chatgpt)
 
     app.state.chatgpt = chatgpt
@@ -493,7 +622,7 @@ async def chat(
     ):
         raise HTTPException(
             status_code=503,
-            detail=("ChatGPT context is not initialized."),
+            detail="ChatGPT context is not initialized.",
         )
 
     try:
@@ -525,6 +654,97 @@ async def chat(
             status_code=500,
             detail=str(exc),
         ) from exc
+
+
+@app.post("/chat/stream")
+async def chat_stream(
+    request: ChatRequest,
+):
+    message = request.message.strip()
+
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail="Message cannot be empty.",
+        )
+
+    if not getattr(
+        app.state,
+        "context_initialized",
+        False,
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="ChatGPT context is not initialized.",
+        )
+
+    async def generate():
+        try:
+            async for chunk in process_chat_stream(
+                app.state.chatgpt,
+                message,
+            ):
+                if not chunk:
+                    continue
+
+                yield (
+                    "data: "
+                    + json.dumps(
+                        chunk,
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+
+                await asyncio.sleep(0)
+
+            yield "data: [DONE]\n\n"
+
+        except (
+            PlaywrightTimeoutError,
+            TimeoutError,
+        ) as exc:
+            print(f"SSE timeout: {exc}")
+
+            payload = json.dumps(
+                {
+                    "error": str(exc),
+                    "type": "timeout",
+                },
+                ensure_ascii=False,
+            )
+
+            yield f"data: {payload}\n\n"
+            yield "data: [DONE]\n\n"
+
+        except (
+            RuntimeError,
+            ValueError,
+            TypeError,
+            sqlite3.Error,
+        ) as exc:
+            print(f"SSE application error: {exc}")
+
+            payload = json.dumps(
+                {
+                    "error": str(exc),
+                    "type": "application",
+                },
+                ensure_ascii=False,
+            )
+
+            yield f"data: {payload}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def format_value(
@@ -585,15 +805,14 @@ def render_database_page(
             detail="Table not found.",
         )
 
-    page = max(
-        1,
-        page,
-    )
+    page = max(1, page)
 
     limit = 50
     offset = (page - 1) * limit
 
-    columns = database.get_table_info(table_name)
+    columns = database.get_table_info(
+        table_name,
+    )
 
     rows = database.get_table_rows(
         table_name,
@@ -601,7 +820,9 @@ def render_database_page(
         offset=offset,
     )
 
-    total_rows = database.get_table_row_count(table_name)
+    total_rows = database.get_table_row_count(
+        table_name,
+    )
 
     pages = max(
         1,
@@ -652,6 +873,25 @@ def render_database_page(
     if page < pages:
         next_link = f"<a href='/db/{escape(table_name)}?page={page + 1}'>Next</a>"
 
+    schema_rows = "".join(
+        f"""
+        <tr>
+            <td>{escape(column["name"])}</td>
+            <td>{escape(column["type"])}</td>
+            <td>
+                {"No" if column["notnull"] else "Yes"}
+            </td>
+            <td>
+                {"Yes" if column["primary_key"] else "No"}
+            </td>
+            <td>
+                {format_value(column["default"])}
+            </td>
+        </tr>
+        """
+        for column in columns
+    )
+
     return database_html(
         f"""
         <a href="/db">← Database</a>
@@ -678,30 +918,7 @@ def render_database_page(
                 <th>Default</th>
             </tr>
 
-            {
-            "".join(
-                f'''
-                    <tr>
-                        <td>
-                            {escape(column["name"])}
-                        </td>
-                        <td>
-                            {escape(column["type"])}
-                        </td>
-                        <td>
-                            {"No" if column["notnull"] else "Yes"}
-                        </td>
-                        <td>
-                            {"Yes" if column["primary_key"] else "No"}
-                        </td>
-                        <td>
-                            {format_value(column["default"])}
-                        </td>
-                    </tr>
-                    '''
-                for column in columns
-            )
-        }
+            {schema_rows}
         </table>
 
         <h2>Rows</h2>
@@ -731,9 +948,11 @@ def render_database_index(
 
         table_rows += (
             "<tr>"
-            f"<td><a href='/db/"
-            f"{escape(name)}'>"
-            f"{escape(name)}</a></td>"
+            f"<td>"
+            f"<a href='/db/{escape(name)}'>"
+            f"{escape(name)}"
+            f"</a>"
+            f"</td>"
             f"<td>{row_count}</td>"
             "</tr>"
         )
@@ -780,8 +999,10 @@ def database_html(
     <html>
     <head>
         <meta charset="utf-8">
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1"
+        >
 
         <title>Database</title>
 
@@ -790,7 +1011,9 @@ def database_html(
                 margin: 0;
                 padding: 40px;
                 font-family:
-                    system-ui, -apple-system, sans-serif;
+                    system-ui,
+                    -apple-system,
+                    sans-serif;
                 background: #f5f5f5;
                 color: #222;
             }}
@@ -906,6 +1129,61 @@ async def database_json():
     return database.get_database_overview()
 
 
+@app.get("/db/history")
+async def database_history(
+    entry_id: int | None = None,
+    action: str | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
+    limit: int = 50,
+):
+    return {
+        "history": database.list_history(
+            entry_id=entry_id,
+            action=action,
+            created_after=created_after,
+            created_before=created_before,
+            limit=limit,
+        )
+    }
+
+
+@app.get(
+    "/db/history/{history_id}",
+)
+async def database_history_row(
+    history_id: int,
+):
+    history = database.get_history(
+        history_id,
+    )
+
+    if history is None:
+        raise HTTPException(
+            status_code=404,
+            detail="History record not found.",
+        )
+
+    return database_html(
+        f"""
+        <a href="/db">← Database</a>
+
+        <h1>History {history_id}</h1>
+
+        <pre>{
+            escape(
+                json.dumps(
+                    history,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+            )
+        }</pre>
+        """
+    )
+
+
 @app.get(
     "/db/{table_name}",
     response_class=HTMLResponse,
@@ -973,7 +1251,9 @@ async def database_schema(
 
     return {
         "table": table_name,
-        "columns": database.get_table_info(table_name),
+        "columns": database.get_table_info(
+            table_name,
+        ),
     }
 
 
@@ -996,58 +1276,7 @@ async def database_rows(
             limit=limit,
             offset=offset,
         ),
-        "count": database.get_table_row_count(table_name),
+        "count": database.get_table_row_count(
+            table_name,
+        ),
     }
-
-
-@app.get("/db/history")
-async def database_history(
-    entry_id: int | None = None,
-    action: str | None = None,
-    created_after: str | None = None,
-    created_before: str | None = None,
-    limit: int = 50,
-):
-    return {
-        "history": database.list_history(
-            entry_id=entry_id,
-            action=action,
-            created_after=created_after,
-            created_before=created_before,
-            limit=limit,
-        )
-    }
-
-
-@app.get(
-    "/db/history/{history_id}",
-)
-async def database_history_row(
-    history_id: int,
-):
-    history = database.get_history(history_id)
-
-    if history is None:
-        raise HTTPException(
-            status_code=404,
-            detail="History record not found.",
-        )
-
-    return database_html(
-        f"""
-        <a href="/db">← Database</a>
-
-        <h1>History {history_id}</h1>
-
-        <pre>{
-            escape(
-                json.dumps(
-                    history,
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
-                )
-            )
-        }</pre>
-        """
-    )

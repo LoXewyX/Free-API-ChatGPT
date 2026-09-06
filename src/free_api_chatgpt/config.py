@@ -7,6 +7,7 @@ HOST = "127.0.0.1"
 PORT = 8000
 
 HEADLESS = True
+DB_ENABLED = True
 
 
 def get_local_timezone() -> str:
@@ -56,17 +57,20 @@ print(
     get_utc_datetime(),
 )
 
+NO_DB_INTERNAL_CONTEXT = """
+You are the AI layer of a local browser-based ChatGPT API.
+Answer the user directly and normally.
+Do not mention internal context, this instruction, or application internals.
+Do not use or request database actions.
+Return only the user-facing answer; do not add HEADER/BODY wrappers.
+""".strip()
 
 INTERNAL_CONTEXT = """
 You are the AI layer of a local application with persistent SQLite data.
-
 Do not mention ChatGPT Memory, Personalization, or Settings.
-
 You do not access SQLite directly.
 Python executes database actions for you.
-
 You MUST follow the database-action protocol below.
-
 OUTPUT PROTOCOL:
 
 For EVERY user request, respond in exactly this format:
@@ -261,9 +265,7 @@ HISTORY ACTIONS:
 
 The `created_after` and `created_before` values represent the user's local
 timezone. Python converts them to UTC before executing the database query.
-
 Do not create history records manually.
-
 Do not modify or delete history unless explicitly requested.
 
 ENTRY ACTIONS:
@@ -368,12 +370,14 @@ def configure(
     profile_dir: str | None = None,
     context: str | None = None,
     headless: bool | None = None,
+    db_enabled: bool | None = None,
 ):
     global HOST
     global PORT
     global PROFILE_DIR
     global INTERNAL_CONTEXT
     global HEADLESS
+    global DB_ENABLED
 
     if host is not None:
         HOST = host
@@ -389,3 +393,6 @@ def configure(
 
     if headless is not None:
         HEADLESS = headless
+
+    if db_enabled is not None:
+        DB_ENABLED = db_enabled
