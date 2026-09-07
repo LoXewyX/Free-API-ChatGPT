@@ -47,13 +47,9 @@ class ChatGPT:
             button = self.page.locator("button.wm-button--primary:nth-child(4)")
 
             if await button.is_visible(timeout=3000):
-                print("Cookie dialog detected.")
-
                 await button.click()
 
                 await self.page.wait_for_timeout(1000)
-
-                print("Cookies accepted.")
 
         except PlaywrightTimeoutError:
             pass
@@ -138,17 +134,6 @@ class ChatGPT:
         prompt: str,
         previous_assistant_count: int,
     ):
-        """
-        Submit a prompt to ChatGPT.
-
-        Uses the submit button when available and ready.
-
-        If the button cannot be used, falls back to Enter.
-
-        Raises TimeoutError if ChatGPT does not accept
-        the prompt within the submission timeout.
-        """
-
         composer = self.composer()
 
         try:
@@ -161,14 +146,14 @@ class ChatGPT:
 
         await composer.fill(prompt)
 
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
 
         submit = self.submit_button()
 
         try:
             await submit.wait_for(
                 state="visible",
-                timeout=5_000,
+                timeout=3_000,
             )
         except PlaywrightTimeoutError:
             submit = None
@@ -182,31 +167,21 @@ class ChatGPT:
                 if state == "ready":
                     try:
                         await submit.click(timeout=2_000)
+
+                        await self.wait_for_new_assistant_message(
+                            previous_assistant_count
+                        )
+
                         return
 
                     except PlaywrightTimeoutError:
-                        break
+                        pass
 
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.05)
 
-        print("Send button unavailable. Using Enter fallback.")
-
-        try:
-            await composer.press("Enter")
-        except PlaywrightTimeoutError as exc:
-            raise TimeoutError("Failed to submit prompt using Enter.") from exc
-
-        deadline = asyncio.get_running_loop().time() + 5.0
-
-        while asyncio.get_running_loop().time() < deadline:
-            count = await self.assistant_count()
-
-            if count > previous_assistant_count:
-                return
-
-            await asyncio.sleep(0.03)
-
-        raise TimeoutError("Timed out waiting for ChatGPT to accept the prompt.")
+        raise TimeoutError(
+            "ChatGPT Send button was unavailable or did not submit the prompt."
+        )
 
     async def wait_for_new_assistant_message(
         self,
@@ -446,8 +421,6 @@ class ChatGPT:
                         if delta:
                             yield delta
 
-                    print("Assistant stream finished.")
-
                     return
 
             if (
@@ -462,8 +435,6 @@ class ChatGPT:
                 final_text = await self.get_latest_assistant_text()
 
                 if final_text == previous_text:
-                    print("Assistant stream finished (DOM stabilized).")
-
                     return
 
                 if final_text:
