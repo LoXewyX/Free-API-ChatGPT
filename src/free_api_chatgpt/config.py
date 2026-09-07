@@ -68,7 +68,7 @@ def load_cookies() -> list[dict] | None:
     return valid_cookies or None
 
 
-COOKIES_JSON: list[dict] = load_cookies()
+COOKIES_JSON = load_cookies()
 
 
 def configure(

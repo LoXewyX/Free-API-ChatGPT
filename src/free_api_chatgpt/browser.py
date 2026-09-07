@@ -8,6 +8,7 @@ from playwright.async_api import (
     Error,
     Page,
     Playwright,
+    Route,
     async_playwright,
 )
 
@@ -23,6 +24,22 @@ class BrowserManager:
         self.playwright: Playwright | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
+
+    async def _route_handler(self, route: Route):
+        """
+        Block resources that are not required by the application.
+
+        CSS and JavaScript are intentionally kept because the application
+        requires normal browser functionality.
+        """
+        if route.request.resource_type in {
+            "image",
+            "font",
+            "media",
+        }:
+            await route.abort()
+        else:
+            await route.continue_()
 
     async def import_cookies(
         self,
@@ -51,7 +68,6 @@ class BrowserManager:
                 continue
 
             expires: float | None = None
-
             raw_expires = cookie.get("expires")
 
             if raw_expires is not None:
@@ -67,7 +83,6 @@ class BrowserManager:
                 continue
 
             same_site: Literal["Lax", "None", "Strict"] | None = None
-
             raw_same_site = cookie.get("sameSite")
 
             if raw_same_site is not None:
@@ -75,10 +90,8 @@ class BrowserManager:
 
                 if normalized == "strict":
                     same_site = "Strict"
-
                 elif normalized == "lax":
                     same_site = "Lax"
-
                 elif normalized in (
                     "none",
                     "no_restriction",
@@ -128,7 +141,6 @@ class BrowserManager:
 
         except Error as exc:
             print(f"Failed to import cookies: {exc}")
-            return
 
     async def start(self) -> Page:
         profile = Path(PROFILE_DIR).resolve()
@@ -150,10 +162,18 @@ class BrowserManager:
             firefox_user_prefs={
                 "permissions.default.microphone": 1,
                 "permissions.default.persistent-storage": 1,
+                "dom.ipc.processCount": 1,
+                "browser.sessionstore.interval": 60000,
+                "browser.sessionstore.resume_from_crash": False,
+                "network.prefetch-next": False,
+                "network.predictor.enabled": False,
+                "network.http.speculative-parallel-limit": 0,
             },
         )
 
         self.context = context
+
+        await context.route("**/*", self._route_handler)
 
         existing_cookies = await context.cookies()
 
@@ -162,7 +182,6 @@ class BrowserManager:
 
         if context.pages:
             self.page = context.pages[0]
-
         else:
             self.page = await context.new_page()
 
@@ -171,6 +190,11 @@ class BrowserManager:
     async def stop(self):
         try:
             if self.context:
+                await self.context.unroute(
+                    "**/*",
+                    self._route_handler,
+                )
+
                 await self.context.close()
 
         finally:
