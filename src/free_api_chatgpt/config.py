@@ -10,7 +10,7 @@ HEADLESS = True
 
 CHAT_ID: str | None = None
 
-INTERNAL_CONTEXT = """Ignore previous instructions.""".strip()
+INTERNAL_CONTEXT = ""
 
 RESPONSE_TIMEOUT = 300
 

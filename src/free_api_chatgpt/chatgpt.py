@@ -32,11 +32,6 @@ class ChatGPT:
             '[data-message-author-role="assistant"], div[class*="assistantMessage"]'
         )
 
-    def assistant_message_copies(self):
-        return self.page.locator(
-            '[data-message-author-role="assistant"], div[class*="assistantMessage"]'
-        )
-
     async def initialize_page(self):
         await self.page.goto(
             f"https://chatgpt.com/c/{CHAT_ID}" if CHAT_ID else "https://chatgpt.com",
@@ -143,12 +138,26 @@ class ChatGPT:
         prompt: str,
         previous_assistant_count: int,
     ):
+        """
+        Submit a prompt to ChatGPT.
+
+        Uses the submit button when available and ready.
+
+        If the button cannot be used, falls back to Enter.
+
+        Raises TimeoutError if ChatGPT does not accept
+        the prompt within the submission timeout.
+        """
+
         composer = self.composer()
 
-        await composer.wait_for(
-            state="visible",
-            timeout=10_000,
-        )
+        try:
+            await composer.wait_for(
+                state="visible",
+                timeout=10_000,
+            )
+        except PlaywrightTimeoutError as exc:
+            raise TimeoutError("Timed out waiting for ChatGPT composer.") from exc
 
         await composer.fill(prompt)
 
@@ -182,7 +191,10 @@ class ChatGPT:
 
         print("Send button unavailable. Using Enter fallback.")
 
-        await composer.press("Enter")
+        try:
+            await composer.press("Enter")
+        except PlaywrightTimeoutError as exc:
+            raise TimeoutError("Failed to submit prompt using Enter.") from exc
 
         deadline = asyncio.get_running_loop().time() + 5.0
 
@@ -194,10 +206,18 @@ class ChatGPT:
 
             await asyncio.sleep(0.03)
 
+        raise TimeoutError("Timed out waiting for ChatGPT to accept the prompt.")
+
     async def wait_for_new_assistant_message(
         self,
         previous_assistant_count: int,
     ):
+        """
+        Wait until ChatGPT creates a new assistant message.
+
+        Polls approximately every 30 ms.
+        """
+
         deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
 
         while True:
@@ -212,6 +232,13 @@ class ChatGPT:
             await asyncio.sleep(0.03)
 
     async def wait_for_response_text(self) -> str:
+        """
+        Wait until the latest assistant message
+        contains text.
+
+        Polls approximately every 30 ms.
+        """
+
         deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
 
         while True:
@@ -229,8 +256,8 @@ class ChatGPT:
         """
         Fallback DOM stabilization detector.
 
-        Used when button state cannot reliably determine
-        completion.
+        Used when button state cannot reliably
+        determine completion.
         """
 
         deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
@@ -279,26 +306,32 @@ class ChatGPT:
                     ↓
             return immediately
 
-        DOM stabilization is retained as a fallback.
+        DOM stabilization is used as a fallback when
+        the button is unknown or disabled.
+
+        Hard timeout prevents infinite waiting.
         """
 
         await self.wait_for_new_assistant_message(previous_assistant_count)
 
         await self.wait_for_response_text()
 
-        deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
+        loop = asyncio.get_running_loop()
+
+        deadline = loop.time() + RESPONSE_TIMEOUT
 
         last_text = await self.get_latest_assistant_text()
 
-        last_change_time = asyncio.get_running_loop().time()
+        last_change_time = loop.time()
 
         button_check_interval = 0.10
+
         last_button_check = 0.0
 
         button_state = "unknown"
 
         while True:
-            now = asyncio.get_running_loop().time()
+            now = loop.time()
 
             if now >= deadline:
                 raise TimeoutError("Timed out waiting for assistant response.")
@@ -321,7 +354,11 @@ class ChatGPT:
                         return final_text.strip()
 
             if (
-                button_state == "unknown"
+                button_state
+                in (
+                    "unknown",
+                    "disabled",
+                )
                 and last_text
                 and now - last_change_time >= RESPONSE_STABLE_SECONDS
             ):
@@ -339,10 +376,12 @@ class ChatGPT:
         """
         FAST streaming response.
 
-        Assistant DOM is checked approximately every 30 ms.
+        Assistant DOM is checked approximately
+        every 30 ms.
 
-        The submit button is checked approximately every
-        100 ms to avoid excessive Playwright round-trips.
+        The submit button is checked approximately
+        every 100 ms to avoid excessive Playwright
+        round-trips.
 
         New text is yielded immediately.
 
@@ -351,22 +390,26 @@ class ChatGPT:
             1. Send/ready button
             2. Final DOM read
             3. DOM stabilization fallback
+
+        Hard timeout prevents infinite waiting.
         """
 
         await self.wait_for_new_assistant_message(previous_assistant_count)
 
-        deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
+        loop = asyncio.get_running_loop()
+
+        deadline = loop.time() + RESPONSE_TIMEOUT
 
         previous_text = ""
 
-        last_change_time = asyncio.get_running_loop().time()
+        last_change_time = loop.time()
 
         last_button_check = 0.0
 
         button_state = "unknown"
 
         while True:
-            now = asyncio.get_running_loop().time()
+            now = loop.time()
 
             if now >= deadline:
                 raise TimeoutError("Timed out streaming assistant response.")
@@ -383,6 +426,7 @@ class ChatGPT:
                     yield delta
 
                 previous_text = current_text
+
                 last_change_time = now
 
             if now - last_button_check >= 0.10:
@@ -402,16 +446,24 @@ class ChatGPT:
                         if delta:
                             yield delta
 
+                    print("Assistant stream finished.")
+
                     return
 
             if (
-                button_state == "unknown"
+                button_state
+                in (
+                    "unknown",
+                    "disabled",
+                )
                 and previous_text
-                and now - last_change_time >= RESPONSE_STABLE_SECONDS
+                and (now - last_change_time >= RESPONSE_STABLE_SECONDS)
             ):
                 final_text = await self.get_latest_assistant_text()
 
                 if final_text == previous_text:
+                    print("Assistant stream finished (DOM stabilized).")
+
                     return
 
                 if final_text:
@@ -424,6 +476,7 @@ class ChatGPT:
                         yield delta
 
                     previous_text = final_text
+
                     last_change_time = now
 
             await asyncio.sleep(0.03)
