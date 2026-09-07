@@ -28,9 +28,6 @@ class BrowserManager:
     async def _route_handler(self, route: Route):
         """
         Block resources that are not required by the application.
-
-        CSS and JavaScript are intentionally kept because the application
-        requires normal browser functionality.
         """
         if route.request.resource_type in {
             "image",
@@ -45,6 +42,9 @@ class BrowserManager:
         self,
         context: BrowserContext,
     ):
+        """
+        Import cookies from cookies.json into the browser context.
+        """
         if COOKIES_JSON is None:
             print("No cookies.json found. Skipping cookie import.")
             return
@@ -82,7 +82,15 @@ class BrowserManager:
             if expires is not None and expires > 0 and expires <= time.time():
                 continue
 
-            same_site: Literal["Lax", "None", "Strict"] | None = None
+            same_site: (
+                Literal[
+                    "Lax",
+                    "None",
+                    "Strict",
+                ]
+                | None
+            ) = None
+
             raw_same_site = cookie.get("sameSite")
 
             if raw_same_site is not None:
@@ -90,8 +98,10 @@ class BrowserManager:
 
                 if normalized == "strict":
                     same_site = "Strict"
+
                 elif normalized == "lax":
                     same_site = "Lax"
+
                 elif normalized in (
                     "none",
                     "no_restriction",
@@ -140,7 +150,10 @@ class BrowserManager:
             await context.add_cookies(valid_cookies)
 
         except Error as exc:
-            print(f"Failed to import cookies: {exc}")
+            print(
+                f"Failed to import cookies: {exc}",
+                flush=True,
+            )
 
     async def start(self) -> Page:
         profile = Path(PROFILE_DIR).resolve()
@@ -173,12 +186,12 @@ class BrowserManager:
 
         self.context = context
 
-        await context.route("**/*", self._route_handler)
+        await context.route(
+            "**/*",
+            self._route_handler,
+        )
 
-        existing_cookies = await context.cookies()
-
-        if not existing_cookies:
-            await self.import_cookies(context)
+        await self.import_cookies(context)
 
         if context.pages:
             self.page = context.pages[0]

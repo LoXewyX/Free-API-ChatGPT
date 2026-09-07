@@ -1,6 +1,5 @@
 import asyncio
 import json
-import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from html import escape
@@ -15,6 +14,7 @@ from .browser import BrowserManager
 from .chatgpt import ChatGPT
 
 browser = BrowserManager()
+chat_lock = asyncio.Lock()
 
 
 class ChatRequest(BaseModel):
@@ -24,6 +24,7 @@ class ChatRequest(BaseModel):
 def extract_header_body(
     response: str,
 ) -> tuple[dict, str]:
+    """Extract the HEADER JSON and BODY from a response."""
     header_marker = "HEADER"
     body_marker = "BODY"
 
@@ -46,12 +47,18 @@ def extract_header_body(
 
     header = json.loads(header_text)
 
-    if not isinstance(header, dict):
+    if not isinstance(
+        header,
+        dict,
+    ):
         raise TypeError("HEADER must contain a JSON object.")
 
     actions = header.get("actions")
 
-    if not isinstance(actions, list):
+    if not isinstance(
+        actions,
+        list,
+    ):
         raise TypeError("HEADER must contain an actions array.")
 
     return header, body
@@ -61,41 +68,27 @@ async def process_chat(
     chatgpt: ChatGPT,
     message: str,
 ) -> str:
-    """
-    NORMAL /chat path.
-
-    This function never calls ask_stream().
-    """
-
-    return (await chatgpt.ask(message)).strip()
+    """Process a normal chat request."""
+    async with chat_lock:
+        return (await chatgpt.ask(message)).strip()
 
 
 async def process_chat_stream(
     chatgpt: ChatGPT,
     message: str,
 ) -> AsyncIterator[str]:
-    """
-    /chat/stream path.
-
-    This is the only normal application path
-    that calls ask_stream().
-    """
-
-    async for chunk in chatgpt.ask_stream(message):
-        if chunk:
-            yield chunk
-
-
-async def initialize_chatgpt_context(
-    chatgpt: ChatGPT,
-):
-    await chatgpt.initialize_context(config.INTERNAL_CONTEXT)
+    """Process a streaming chat request."""
+    async with chat_lock:
+        async for chunk in chatgpt.ask_stream(message):
+            if chunk:
+                yield chunk
 
 
 @asynccontextmanager
 async def lifespan(
     app: FastAPI,
 ):
+    """Initialize and shut down the browser."""
     page = await browser.start()
 
     chatgpt = ChatGPT(page)
@@ -103,19 +96,23 @@ async def lifespan(
     await chatgpt.initialize_page()
 
     if config.INTERNAL_CONTEXT:
-        await initialize_chatgpt_context(chatgpt)
+        await chatgpt.initialize_context()
 
     elif config.CHAT_ID:
-        print("Using existing ChatGPT conversation as context.")
-
-        chatgpt.context_initialized = True
+        print(
+            "Using existing ChatGPT conversation as context.",
+            flush=True,
+        )
 
     else:
-        print("WARNING: No internal context configured.")
-
-        print("Using the currently opened ChatGPT conversation as context.")
-
-        chatgpt.context_initialized = True
+        print(
+            "WARNING: No internal context configured.",
+            flush=True,
+        )
+        print(
+            "Using the currently opened ChatGPT conversation as context.",
+            flush=True,
+        )
 
     app.state.chatgpt = chatgpt
 
@@ -132,15 +129,20 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
+    """Return API health status."""
     chatgpt = getattr(
         app.state,
         "chatgpt",
         None,
     )
 
+    if chatgpt is None:
+        return {
+            "status": "starting",
+        }
+
     return {
         "status": "ok",
-        "context_initialized": (chatgpt is not None and chatgpt.context_initialized),
     }
 
 
@@ -148,6 +150,7 @@ async def health():
 async def chat(
     request: ChatRequest,
 ):
+    """Return a complete ChatGPT response."""
     message = request.message.strip()
 
     if not message:
@@ -166,12 +169,6 @@ async def chat(
         raise HTTPException(
             status_code=503,
             detail="ChatGPT is not initialized.",
-        )
-
-    if not chatgpt.context_initialized:
-        raise HTTPException(
-            status_code=503,
-            detail=("ChatGPT context is not initialized."),
         )
 
     try:
@@ -197,7 +194,6 @@ async def chat(
         RuntimeError,
         ValueError,
         TypeError,
-        sqlite3.Error,
     ) as exc:
         raise HTTPException(
             status_code=500,
@@ -209,6 +205,7 @@ async def chat(
 async def chat_stream(
     request: ChatRequest,
 ):
+    """Stream a ChatGPT response using Server-Sent Events."""
     message = request.message.strip()
 
     if not message:
@@ -229,13 +226,8 @@ async def chat_stream(
             detail="ChatGPT is not initialized.",
         )
 
-    if not chatgpt.context_initialized:
-        raise HTTPException(
-            status_code=503,
-            detail=("ChatGPT context is not initialized."),
-        )
-
     async def generate():
+        """Generate Server-Sent Events."""
         try:
             async for chunk in process_chat_stream(
                 chatgpt,
@@ -244,16 +236,12 @@ async def chat_stream(
                 if not chunk:
                     continue
 
-                yield (
-                    "data: "
-                    + json.dumps(
-                        chunk,
-                        ensure_ascii=False,
-                    )
-                    + "\n\n"
+                payload = json.dumps(
+                    chunk,
+                    ensure_ascii=False,
                 )
 
-                await asyncio.sleep(0)
+                yield (f"data: {payload}\n\n")
 
             yield "data: [DONE]\n\n"
 
@@ -261,8 +249,6 @@ async def chat_stream(
             PlaywrightTimeoutError,
             TimeoutError,
         ) as exc:
-            print(f"SSE timeout: {exc}")
-
             payload = json.dumps(
                 {
                     "error": str(exc),
@@ -272,17 +258,13 @@ async def chat_stream(
             )
 
             yield (f"data: {payload}\n\n")
-
             yield "data: [DONE]\n\n"
 
         except (
             RuntimeError,
             ValueError,
             TypeError,
-            sqlite3.Error,
         ) as exc:
-            print(f"SSE application error: {exc}")
-
             payload = json.dumps(
                 {
                     "error": str(exc),
@@ -292,7 +274,6 @@ async def chat_stream(
             )
 
             yield (f"data: {payload}\n\n")
-
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(
@@ -309,6 +290,7 @@ async def chat_stream(
 def format_value(
     value,
 ) -> str:
+    """Format a value for HTML output."""
     if value is None:
         return "<span class='null'>NULL</span>"
 

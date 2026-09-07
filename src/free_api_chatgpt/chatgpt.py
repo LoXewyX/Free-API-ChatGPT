@@ -1,522 +1,405 @@
 import asyncio
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncGenerator
 
-from playwright.async_api import Page
+from playwright.async_api import Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from .config import (
+from free_api_chatgpt.config import (
     CHAT_ID,
-    RESPONSE_STABLE_SECONDS,
-    RESPONSE_TIMEOUT,
+    HEADLESS,
+    INTERNAL_CONTEXT,
 )
 
 
 class ChatGPT:
-    def __init__(self, page: Page):
+    """Browser-based ChatGPT client."""
+
+    def __init__(
+        self,
+        page: Page,
+        context=None,
+        chat_id=None,
+    ):
         self.page = page
-        self.context_initialized = False
+        self.context = context or INTERNAL_CONTEXT
+        self.chat_id = chat_id or CHAT_ID
+        self.headless = HEADLESS
+        self._last_response = ""
 
-    def composer(self):
-        return self.page.get_by_role("textbox").first
+    async def composer(self) -> Locator:
+        """Return the ChatGPT message composer."""
+        composer = self.page.get_by_role("textbox").first
 
-    def submit_button(self):
-        """
-        Supports both older and newer ChatGPT submit-button classes.
-        """
-        return self.page.locator(
-            'button.wm-composer-submitButton, button[class*="composer-submit-button"]'
-        ).first
-
-    def assistant_messages(self):
-        return self.page.locator(
-            '[data-message-author-role="assistant"], div[class*="assistantMessage"]'
+        await composer.wait_for(
+            state="visible",
+            timeout=30000,
         )
 
-    async def initialize_page(self):
+        return composer
+
+    async def find_submit_button(self) -> Locator:
+        """Find the exact ChatGPT submit button."""
+        button = self.page.locator("#composer-submit-button")
+
+        await button.wait_for(
+            state="visible",
+            timeout=30000,
+        )
+
+        return button
+
+    async def submit_button_state(self) -> str:
+        """Read the submit button state directly from the DOM."""
+        return await self.page.evaluate(
+            """
+            () => {
+                const button =
+                    document.querySelector("#composer-submit-button");
+
+                if (!button) {
+                    return "missing";
+                }
+
+                const ariaDisabled =
+                    button.getAttribute("aria-disabled");
+
+                const ariaLabel =
+                    (
+                        button.getAttribute("aria-label") || ""
+                    ).toLowerCase();
+
+                if (
+                    button.disabled ||
+                    ariaDisabled === "true"
+                ) {
+                    return "disabled";
+                }
+
+                if (
+                    ariaLabel.includes("stop") ||
+                    ariaLabel.includes("cancel") ||
+                    ariaLabel.includes("interrupt")
+                ) {
+                    return "busy";
+                }
+
+                return "ready";
+            }
+            """
+        )
+
+    async def generation_state(self) -> str:
+        """Read the generation state directly from the DOM."""
+        return await self.page.evaluate(
+            """
+            () => {
+                const submit =
+                    document.querySelector("#composer-submit-button");
+
+                if (!submit) {
+                    return "unknown";
+                }
+
+                const ariaDisabled =
+                    submit.getAttribute("aria-disabled");
+
+                const ariaLabel =
+                    (
+                        submit.getAttribute("aria-label") || ""
+                    ).toLowerCase();
+
+                if (
+                    submit.disabled ||
+                    ariaDisabled === "true"
+                ) {
+                    return "generating";
+                }
+
+                if (
+                    ariaLabel.includes("stop") ||
+                    ariaLabel.includes("cancel") ||
+                    ariaLabel.includes("interrupt")
+                ) {
+                    return "generating";
+                }
+
+                return "ready";
+            }
+            """
+        )
+
+    async def assistant_messages(self) -> Locator:
+        """Return assistant message elements."""
+        return self.page.locator('[data-message-author-role="assistant"]')
+
+    async def assistant_count(self) -> int:
+        """Return the number of assistant messages."""
+        return await (await self.assistant_messages()).count()
+
+    async def get_latest_assistant_text(self) -> str:
+        """Return the latest assistant response."""
+        return await self.page.evaluate(
+            """
+            () => {
+                const messages =
+                    document.querySelectorAll(
+                        '[data-message-author-role="assistant"]'
+                    );
+
+                if (!messages.length) {
+                    return "";
+                }
+
+                const message =
+                    messages[messages.length - 1];
+
+                return (
+                    message.innerText || ""
+                ).trim();
+            }
+            """
+        )
+
+    async def accept_cookies(self) -> None:
+        """Accept the cookie dialog when present."""
+        selectors = [
+            'button:has-text("Accept")',
+            'button:has-text("Accept all")',
+            'button:has-text("Allow all")',
+            'button:has-text("Agree")',
+        ]
+
+        for selector in selectors:
+            locator = self.page.locator(selector)
+            count = await locator.count()
+
+            for index in range(count):
+                button = locator.nth(index)
+
+                if await button.is_visible():
+                    try:
+                        await button.click(timeout=3000)
+                    except PlaywrightTimeoutError:
+                        pass
+
+                    return
+
+    async def initialize_page(self) -> None:
+        """Open ChatGPT and wait for the composer."""
+        if self.chat_id:
+            url = f"https://chatgpt.com/c/{self.chat_id}"
+        else:
+            url = "https://chatgpt.com"
+
         await self.page.goto(
-            f"https://chatgpt.com/c/{CHAT_ID}" if CHAT_ID else "https://chatgpt.com",
+            url,
             wait_until="domcontentloaded",
+            timeout=60000,
         )
 
-        await self.page.wait_for_timeout(3000)
+        await asyncio.sleep(3)
 
         await self.accept_cookies()
 
-    async def accept_cookies(self):
-        try:
-            button = self.page.locator("button.wm-button--primary:nth-child(4)")
-
-            if await button.is_visible(timeout=3000):
-                await button.click()
-
-                await self.page.wait_for_timeout(1000)
-
-        except PlaywrightTimeoutError:
-            pass
-
-    async def assistant_count(self) -> int:
-        return await self.assistant_messages().count()
-
-    async def get_latest_assistant_text(self) -> str:
-        messages = self.assistant_messages()
-
-        count = await messages.count()
-
-        if count == 0:
-            return ""
-
-        latest = messages.nth(count - 1)
-
-        try:
-            text = await latest.inner_text()
-            return text.strip()
-
-        except PlaywrightTimeoutError:
-            return ""
-
-    async def submit_button_state(self) -> str:
-        """
-        Best-effort detection of the ChatGPT send/stop button.
-
-        Returns:
-
-            generating
-            ready
-            disabled
-            unknown
-        """
-
-        button = self.submit_button()
-
-        try:
-            if await button.count() == 0:
-                return "unknown"
-
-            if not await button.is_visible():
-                return "unknown"
-
-            aria_disabled = await button.get_attribute("aria-disabled")
-
-            disabled = await button.is_disabled()
-
-            aria = (await button.get_attribute("aria-label") or "").lower()
-
-            title = (await button.get_attribute("title") or "").lower()
-
-            text = (await button.inner_text() or "").lower()
-
-            value = f"{aria} {title} {text}"
-
-            if any(
-                word in value
-                for word in (
-                    "stop",
-                    "cancel",
-                    "interrupt",
-                    "generating",
-                )
-            ):
-                return "generating"
-
-            if disabled:
-                return "disabled"
-
-            if aria_disabled == "true":
-                return "disabled"
-
-            return "ready"
-
-        except PlaywrightTimeoutError:
-            return "unknown"
+        await self.composer()
 
     async def submit_prompt(
         self,
         prompt: str,
-        previous_assistant_count: int,
-    ):
-        composer = self.composer()
-
-        try:
-            await composer.wait_for(
-                state="visible",
-                timeout=10_000,
-            )
-        except PlaywrightTimeoutError as exc:
-            raise TimeoutError("Timed out waiting for ChatGPT composer.") from exc
+    ) -> None:
+        """Fill and submit a prompt."""
+        composer = await self.composer()
 
         await composer.fill(prompt)
 
-        await asyncio.sleep(0.1)
+        button = await self.find_submit_button()
 
-        submit = self.submit_button()
+        deadline = time.monotonic() + 10
 
-        try:
-            await submit.wait_for(
-                state="visible",
-                timeout=3_000,
-            )
-        except PlaywrightTimeoutError:
-            submit = None
+        while time.monotonic() < deadline:
+            state = await self.submit_button_state()
 
-        if submit is not None:
-            deadline = asyncio.get_running_loop().time() + 5.0
-
-            while asyncio.get_running_loop().time() < deadline:
-                state = await self.submit_button_state()
-
-                if state == "ready":
-                    try:
-                        await submit.click(timeout=2_000)
-
-                        await self.wait_for_new_assistant_message(
-                            previous_assistant_count
-                        )
-
-                        return
-
-                    except PlaywrightTimeoutError:
-                        pass
-
-                await asyncio.sleep(0.05)
-
-        raise TimeoutError(
-            "ChatGPT Send button was unavailable or did not submit the prompt."
-        )
-
-    async def wait_for_new_assistant_message(
-        self,
-        previous_assistant_count: int,
-    ):
-        """
-        Wait until ChatGPT creates a new assistant message.
-
-        Polls approximately every 30 ms.
-        """
-
-        deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
-
-        while True:
-            count = await self.assistant_count()
-
-            if count > previous_assistant_count:
+            if state == "ready":
+                await button.click(timeout=10000)
                 return
 
-            if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError("Timed out waiting for new assistant message.")
+            await asyncio.sleep(0.05)
 
-            await asyncio.sleep(0.03)
-
-    async def wait_for_response_text(self) -> str:
-        """
-        Wait until the latest assistant message
-        contains text.
-
-        Polls approximately every 30 ms.
-        """
-
-        deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
-
-        while True:
-            text = await self.get_latest_assistant_text()
-
-            if text:
-                return text
-
-            if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError("Timed out waiting for assistant response text.")
-
-            await asyncio.sleep(0.03)
-
-    async def wait_for_stable_response(self) -> str:
-        """
-        Fallback DOM stabilization detector.
-
-        Used when button state cannot reliably
-        determine completion.
-        """
-
-        deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
-
-        previous_text = None
-        stable_since = None
-
-        while True:
-            current_text = await self.get_latest_assistant_text()
-
-            now = asyncio.get_running_loop().time()
-
-            if current_text:
-                if current_text == previous_text:
-                    if stable_since is None:
-                        stable_since = now
-
-                    if now - stable_since >= RESPONSE_STABLE_SECONDS:
-                        return current_text.strip()
-
-                else:
-                    previous_text = current_text
-                    stable_since = None
-
-            if now >= deadline:
-                raise TimeoutError("Timed out waiting for stable assistant response.")
-
-            await asyncio.sleep(0.03)
+        raise PlaywrightTimeoutError("ChatGPT submit button did not become ready.")
 
     async def wait_for_response(
         self,
         previous_assistant_count: int,
+        previous_assistant_text: str,
+        timeout: float = 120,
     ) -> str:
-        """
-        NORMAL /chat response.
+        """Wait until the assistant response stops changing."""
+        start = time.monotonic()
 
-        Fast completion path:
+        previous_text = (previous_assistant_text or "").strip()
 
-            new assistant message
-                    ↓
-            text appears
-                    ↓
-            button becomes ready
-                    ↓
-            final DOM read
-                    ↓
-            return immediately
+        last_text = previous_text
+        response_started = False
+        last_change = None
 
-        DOM stabilization is used as a fallback when
-        the button is unknown or disabled.
-
-        Hard timeout prevents infinite waiting.
-        """
-
-        await self.wait_for_new_assistant_message(previous_assistant_count)
-
-        await self.wait_for_response_text()
-
-        loop = asyncio.get_running_loop()
-
-        deadline = loop.time() + RESPONSE_TIMEOUT
-
-        last_text = await self.get_latest_assistant_text()
-
-        last_change_time = loop.time()
-
-        button_check_interval = 0.10
-
-        last_button_check = 0.0
-
-        button_state = "unknown"
-
-        while True:
-            now = loop.time()
-
-            if now >= deadline:
-                raise TimeoutError("Timed out waiting for assistant response.")
-
+        while time.monotonic() - start < timeout:
             current_text = await self.get_latest_assistant_text()
+
+            if current_text and current_text != previous_text:
+                response_started = True
 
             if current_text != last_text:
                 last_text = current_text
-                last_change_time = now
+                last_change = time.monotonic()
 
-            if now - last_button_check >= button_check_interval:
-                last_button_check = now
+            if response_started and last_text:
+                if last_change is None:
+                    last_change = time.monotonic()
 
-                button_state = await self.submit_button_state()
+                if time.monotonic() - last_change >= 0.8:
+                    await asyncio.sleep(0.15)
 
-                if button_state == "ready":
                     final_text = await self.get_latest_assistant_text()
 
-                    if final_text:
-                        return final_text.strip()
+                    if final_text == last_text:
+                        return final_text
 
-            if (
-                button_state
-                in (
-                    "unknown",
-                    "disabled",
-                )
-                and last_text
-                and now - last_change_time >= RESPONSE_STABLE_SECONDS
-            ):
-                final_text = await self.get_latest_assistant_text()
+                    last_text = final_text
+                    last_change = time.monotonic()
 
-                if final_text == last_text:
-                    return final_text.strip()
+            await asyncio.sleep(0.05)
 
-            await asyncio.sleep(0.03)
+        if response_started and last_text:
+            return last_text
+
+        raise TimeoutError("Timed out waiting for ChatGPT response.")
 
     async def stream_response(
         self,
         previous_assistant_count: int,
-    ) -> AsyncIterator[str]:
-        """
-        FAST streaming response.
+        previous_assistant_text: str,
+        timeout: float = 120,
+    ) -> AsyncGenerator[str, None]:
+        """Stream the assistant response until its text is stable."""
+        start = time.monotonic()
 
-        Assistant DOM is checked approximately
-        every 30 ms.
+        previous_text = (previous_assistant_text or "").strip()
 
-        The submit button is checked approximately
-        every 100 ms to avoid excessive Playwright
-        round-trips.
+        current_text = previous_text
+        response_started = False
+        last_change = None
 
-        New text is yielded immediately.
+        while time.monotonic() - start < timeout:
+            latest_text = await self.get_latest_assistant_text()
 
-        Completion uses:
+            if latest_text and latest_text != previous_text:
+                response_started = True
 
-            1. Send/ready button
-            2. Final DOM read
-            3. DOM stabilization fallback
-
-        Hard timeout prevents infinite waiting.
-        """
-
-        await self.wait_for_new_assistant_message(previous_assistant_count)
-
-        loop = asyncio.get_running_loop()
-
-        deadline = loop.time() + RESPONSE_TIMEOUT
-
-        previous_text = ""
-
-        last_change_time = loop.time()
-
-        last_button_check = 0.0
-
-        button_state = "unknown"
-
-        while True:
-            now = loop.time()
-
-            if now >= deadline:
-                raise TimeoutError("Timed out streaming assistant response.")
-
-            current_text = await self.get_latest_assistant_text()
-
-            if current_text != previous_text:
-                if current_text.startswith(previous_text):
-                    delta = current_text[len(previous_text) :]
+            if latest_text != current_text:
+                if latest_text.startswith(current_text):
+                    delta = latest_text[len(current_text) :]
                 else:
-                    delta = current_text
+                    delta = latest_text
+
+                current_text = latest_text
+                last_change = time.monotonic()
 
                 if delta:
                     yield delta
 
-                previous_text = current_text
+            if response_started and current_text:
+                if last_change is None:
+                    last_change = time.monotonic()
 
-                last_change_time = now
+                if time.monotonic() - last_change >= 0.8:
+                    await asyncio.sleep(0.15)
 
-            if now - last_button_check >= 0.10:
-                last_button_check = now
-
-                button_state = await self.submit_button_state()
-
-                if button_state == "ready":
                     final_text = await self.get_latest_assistant_text()
 
-                    if final_text != previous_text:
-                        if final_text.startswith(previous_text):
-                            delta = final_text[len(previous_text) :]
-                        else:
-                            delta = final_text
+                    if final_text == current_text:
+                        return
 
-                        if delta:
-                            yield delta
-
-                    return
-
-            if (
-                button_state
-                in (
-                    "unknown",
-                    "disabled",
-                )
-                and previous_text
-                and (now - last_change_time >= RESPONSE_STABLE_SECONDS)
-            ):
-                final_text = await self.get_latest_assistant_text()
-
-                if final_text == previous_text:
-                    return
-
-                if final_text:
-                    if final_text.startswith(previous_text):
-                        delta = final_text[len(previous_text) :]
+                    if final_text.startswith(current_text):
+                        delta = final_text[len(current_text) :]
                     else:
                         delta = final_text
+
+                    current_text = final_text
+                    last_change = time.monotonic()
 
                     if delta:
                         yield delta
 
-                    previous_text = final_text
+            await asyncio.sleep(0.05)
 
-                    last_change_time = now
+        if response_started and current_text:
+            final_text = await self.get_latest_assistant_text()
 
-            await asyncio.sleep(0.03)
+            if final_text != current_text:
+                if final_text.startswith(current_text):
+                    delta = final_text[len(current_text) :]
+                else:
+                    delta = final_text
 
-    async def initialize_context(
-        self,
-        context: str,
-    ):
-        """
-        Context initialization is NORMAL.
+                if delta:
+                    yield delta
 
-        It does not stream.
-        """
+            return
 
-        previous_assistant_count = await self.assistant_count()
+        raise TimeoutError("Timed out waiting for ChatGPT response.")
 
-        await self.submit_prompt(
-            context,
-            previous_assistant_count,
+    async def initialize_context(self) -> None:
+        """Send the configured context to ChatGPT."""
+        if not self.context:
+            return
+
+        previous_count = await self.assistant_count()
+        previous_text = await self.get_latest_assistant_text()
+
+        await self.submit_prompt(self.context)
+
+        await self.wait_for_response(
+            previous_assistant_count=previous_count,
+            previous_assistant_text=previous_text,
         )
-
-        await self.wait_for_response(previous_assistant_count)
-
-        self.context_initialized = True
 
     async def ask(
         self,
         prompt: str,
     ) -> str:
-        """
-        NORMAL /chat API.
+        """Send a prompt and return the complete response."""
+        previous_count = await self.assistant_count()
+        previous_text = await self.get_latest_assistant_text()
 
-        Returns only after ChatGPT has finished.
-        """
+        await self.submit_prompt(prompt)
 
-        if not self.context_initialized:
-            raise RuntimeError("ChatGPT internal context is not initialized.")
-
-        previous_assistant_count = await self.assistant_count()
-
-        await self.submit_prompt(
-            prompt,
-            previous_assistant_count,
+        response = await self.wait_for_response(
+            previous_assistant_count=previous_count,
+            previous_assistant_text=previous_text,
         )
 
-        response = await self.wait_for_response(previous_assistant_count)
+        self._last_response = response
 
-        return response.strip()
+        return response
 
     async def ask_stream(
         self,
         prompt: str,
-    ) -> AsyncIterator[str]:
-        """
-        STREAMING /chat/stream API.
+    ) -> AsyncGenerator[str, None]:
+        """Send a prompt and stream the complete response."""
+        previous_count = await self.assistant_count()
+        previous_text = await self.get_latest_assistant_text()
 
-        This is the only method that calls
-        stream_response().
-        """
+        await self.submit_prompt(prompt)
 
-        if not self.context_initialized:
-            raise RuntimeError("ChatGPT internal context is not initialized.")
+        chunks = []
 
-        previous_assistant_count = await self.assistant_count()
-
-        await self.submit_prompt(
-            prompt,
-            previous_assistant_count,
-        )
-
-        async for chunk in self.stream_response(previous_assistant_count):
+        async for chunk in self.stream_response(
+            previous_assistant_count=previous_count,
+            previous_assistant_text=previous_text,
+        ):
+            chunks.append(chunk)
             yield chunk
+
+        self._last_response = "".join(chunks)
