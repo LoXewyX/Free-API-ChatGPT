@@ -5,6 +5,7 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .config import (
+    CHAT_ID,
     RESPONSE_STABLE_SECONDS,
     RESPONSE_TIMEOUT,
 )
@@ -19,29 +20,30 @@ class ChatGPT:
         return self.page.get_by_role("textbox").first
 
     def submit_button(self):
-        return self.page.locator("button.wm-composer-submitButton")
+        """
+        Supports both older and newer ChatGPT submit-button classes.
+        """
+        return self.page.locator(
+            'button.wm-composer-submitButton, button[class*="composer-submit-button"]'
+        ).first
 
     def assistant_messages(self):
-        return self.page.locator('div[class*="assistantMessage"]')
+        return self.page.locator(
+            '[data-message-author-role="assistant"], div[class*="assistantMessage"]'
+        )
 
     def assistant_message_copies(self):
         return self.page.locator(
-            'ol[class*="messageList"] > li '
-            'div[class*="assistantMessage"] '
-            'div[class*="messageCopy"]'
+            '[data-message-author-role="assistant"], div[class*="assistantMessage"]'
         )
 
     async def initialize_page(self):
-        print("OPENING CHATGPT")
-
         await self.page.goto(
-            "https://chatgpt.com",
+            f"https://chatgpt.com/c/{CHAT_ID}" if CHAT_ID else "https://chatgpt.com",
             wait_until="domcontentloaded",
         )
 
         await self.page.wait_for_timeout(3000)
-
-        print("ChatGPT page loaded.")
 
         await self.accept_cookies()
 
@@ -65,14 +67,14 @@ class ChatGPT:
         return await self.assistant_messages().count()
 
     async def get_latest_assistant_text(self) -> str:
-        copies = self.assistant_message_copies()
+        messages = self.assistant_messages()
 
-        count = await copies.count()
+        count = await messages.count()
 
         if count == 0:
             return ""
 
-        latest = copies.last
+        latest = messages.nth(count - 1)
 
         try:
             text = await latest.inner_text()
@@ -85,8 +87,12 @@ class ChatGPT:
         """
         Best-effort detection of the ChatGPT send/stop button.
 
-        This is useful for streaming, but normal response
-        completion does NOT depend on this method.
+        Returns:
+
+            generating
+            ready
+            disabled
+            unknown
         """
 
         button = self.submit_button()
@@ -135,23 +141,18 @@ class ChatGPT:
     async def submit_prompt(
         self,
         prompt: str,
+        previous_assistant_count: int,
     ):
         composer = self.composer()
-
-        print("Waiting for composer...")
 
         await composer.wait_for(
             state="visible",
             timeout=10_000,
         )
 
-        print("Composer ready.")
-
         await composer.fill(prompt)
 
-        print("Prompt entered.")
-
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.05)
 
         submit = self.submit_button()
 
@@ -172,15 +173,12 @@ class ChatGPT:
                 if state == "ready":
                     try:
                         await submit.click(timeout=2_000)
-
-                        print("Prompt submitted.")
-
                         return
 
                     except PlaywrightTimeoutError:
                         break
 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.03)
 
         print("Send button unavailable. Using Enter fallback.")
 
@@ -191,68 +189,49 @@ class ChatGPT:
         while asyncio.get_running_loop().time() < deadline:
             count = await self.assistant_count()
 
-            if count > 0:
-                print("Prompt submitted.")
+            if count > previous_assistant_count:
                 return
 
-            await asyncio.sleep(0.1)
-
-        print("Prompt sent. Waiting for assistant response.")
+            await asyncio.sleep(0.03)
 
     async def wait_for_new_assistant_message(
         self,
         previous_assistant_count: int,
     ):
-        print(
-            "Waiting for new assistant message "
-            f"(previous count: "
-            f"{previous_assistant_count})..."
-        )
-
         deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
 
         while True:
             count = await self.assistant_count()
 
             if count > previous_assistant_count:
-                print(f"New assistant message detected (count: {count}).")
-
                 return
 
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError("Timed out waiting for new assistant message.")
 
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.03)
 
     async def wait_for_response_text(self) -> str:
-        print("Waiting for response text...")
-
         deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
 
         while True:
             text = await self.get_latest_assistant_text()
 
             if text:
-                print("Response text detected.")
                 return text
 
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError("Timed out waiting for assistant response text.")
 
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.03)
 
     async def wait_for_stable_response(self) -> str:
         """
-        Determines completion from the assistant DOM.
+        Fallback DOM stabilization detector.
 
-        We do NOT depend on the Send button.
-
-        Once the response text remains unchanged for
-        RESPONSE_STABLE_SECONDS, generation is considered
-        complete.
+        Used when button state cannot reliably determine
+        completion.
         """
-
-        print("Waiting for assistant response to stabilize...")
 
         deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
 
@@ -262,26 +241,24 @@ class ChatGPT:
         while True:
             current_text = await self.get_latest_assistant_text()
 
+            now = asyncio.get_running_loop().time()
+
             if current_text:
                 if current_text == previous_text:
                     if stable_since is None:
-                        stable_since = asyncio.get_running_loop().time()
+                        stable_since = now
 
-                    stable_for = asyncio.get_running_loop().time() - stable_since
-
-                    if stable_for >= RESPONSE_STABLE_SECONDS:
-                        print("Assistant response stabilized.")
-
+                    if now - stable_since >= RESPONSE_STABLE_SECONDS:
                         return current_text.strip()
 
                 else:
                     previous_text = current_text
                     stable_since = None
 
-            if asyncio.get_running_loop().time() >= deadline:
+            if now >= deadline:
                 raise TimeoutError("Timed out waiting for stable assistant response.")
 
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.03)
 
     async def wait_for_response(
         self,
@@ -290,134 +267,187 @@ class ChatGPT:
         """
         NORMAL /chat response.
 
-        No streaming.
-
-        No dependency on the Send button.
-
-        Flow:
+        Fast completion path:
 
             new assistant message
                     ↓
-            response text appears
+            text appears
                     ↓
-            response stops changing
+            button becomes ready
                     ↓
-            return complete response
+            final DOM read
+                    ↓
+            return immediately
+
+        DOM stabilization is retained as a fallback.
         """
 
         await self.wait_for_new_assistant_message(previous_assistant_count)
 
         await self.wait_for_response_text()
 
-        return await self.wait_for_stable_response()
+        deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
+
+        last_text = await self.get_latest_assistant_text()
+
+        last_change_time = asyncio.get_running_loop().time()
+
+        button_check_interval = 0.10
+        last_button_check = 0.0
+
+        button_state = "unknown"
+
+        while True:
+            now = asyncio.get_running_loop().time()
+
+            if now >= deadline:
+                raise TimeoutError("Timed out waiting for assistant response.")
+
+            current_text = await self.get_latest_assistant_text()
+
+            if current_text != last_text:
+                last_text = current_text
+                last_change_time = now
+
+            if now - last_button_check >= button_check_interval:
+                last_button_check = now
+
+                button_state = await self.submit_button_state()
+
+                if button_state == "ready":
+                    final_text = await self.get_latest_assistant_text()
+
+                    if final_text:
+                        return final_text.strip()
+
+            if (
+                button_state == "unknown"
+                and last_text
+                and now - last_change_time >= RESPONSE_STABLE_SECONDS
+            ):
+                final_text = await self.get_latest_assistant_text()
+
+                if final_text == last_text:
+                    return final_text.strip()
+
+            await asyncio.sleep(0.03)
 
     async def stream_response(
         self,
         previous_assistant_count: int,
     ) -> AsyncIterator[str]:
         """
-        STREAMING-ONLY response.
+        FAST streaming response.
 
-        This method is used only by ask_stream().
+        Assistant DOM is checked approximately every 30 ms.
 
-        It observes changes to the assistant DOM and yields
-        only newly added text.
+        The submit button is checked approximately every
+        100 ms to avoid excessive Playwright round-trips.
+
+        New text is yielded immediately.
+
+        Completion uses:
+
+            1. Send/ready button
+            2. Final DOM read
+            3. DOM stabilization fallback
         """
 
         await self.wait_for_new_assistant_message(previous_assistant_count)
 
-        print("Streaming assistant response...")
-
         deadline = asyncio.get_running_loop().time() + RESPONSE_TIMEOUT
 
         previous_text = ""
+
         last_change_time = asyncio.get_running_loop().time()
 
+        last_button_check = 0.0
+
+        button_state = "unknown"
+
         while True:
-            current_text = await self.get_latest_assistant_text()
-
             now = asyncio.get_running_loop().time()
-
-            if current_text:
-                if current_text.startswith(previous_text):
-                    delta = current_text[len(previous_text) :]
-
-                    if delta:
-                        yield delta
-
-                        previous_text = current_text
-                        last_change_time = now
-
-                elif current_text != previous_text:
-                    yield current_text
-
-                    previous_text = current_text
-                    last_change_time = now
-
-                state = await self.submit_button_state()
-
-                stable_for = now - last_change_time
-
-                if state == "ready":
-                    await asyncio.sleep(0.05)
-
-                    final_text = await self.get_latest_assistant_text()
-
-                    if final_text and final_text != previous_text:
-                        if final_text.startswith(previous_text):
-                            yield final_text[len(previous_text) :]
-                        else:
-                            yield final_text
-
-                    print("Assistant stream finished.")
-
-                    return
-
-                if stable_for >= RESPONSE_STABLE_SECONDS:
-                    await asyncio.sleep(0.05)
-
-                    final_text = await self.get_latest_assistant_text()
-
-                    if final_text == previous_text:
-                        print("Assistant stream finished (DOM stabilized).")
-
-                        return
-
-                    if final_text:
-                        if final_text.startswith(previous_text):
-                            yield final_text[len(previous_text) :]
-                        else:
-                            yield final_text
-
-                        previous_text = final_text
-                        last_change_time = asyncio.get_running_loop().time()
 
             if now >= deadline:
                 raise TimeoutError("Timed out streaming assistant response.")
 
-            await asyncio.sleep(0.10)
+            current_text = await self.get_latest_assistant_text()
+
+            if current_text != previous_text:
+                if current_text.startswith(previous_text):
+                    delta = current_text[len(previous_text) :]
+                else:
+                    delta = current_text
+
+                if delta:
+                    yield delta
+
+                previous_text = current_text
+                last_change_time = now
+
+            if now - last_button_check >= 0.10:
+                last_button_check = now
+
+                button_state = await self.submit_button_state()
+
+                if button_state == "ready":
+                    final_text = await self.get_latest_assistant_text()
+
+                    if final_text != previous_text:
+                        if final_text.startswith(previous_text):
+                            delta = final_text[len(previous_text) :]
+                        else:
+                            delta = final_text
+
+                        if delta:
+                            yield delta
+
+                    return
+
+            if (
+                button_state == "unknown"
+                and previous_text
+                and now - last_change_time >= RESPONSE_STABLE_SECONDS
+            ):
+                final_text = await self.get_latest_assistant_text()
+
+                if final_text == previous_text:
+                    return
+
+                if final_text:
+                    if final_text.startswith(previous_text):
+                        delta = final_text[len(previous_text) :]
+                    else:
+                        delta = final_text
+
+                    if delta:
+                        yield delta
+
+                    previous_text = final_text
+                    last_change_time = now
+
+            await asyncio.sleep(0.03)
 
     async def initialize_context(
         self,
         context: str,
     ):
         """
-        Context initialization is always NORMAL.
+        Context initialization is NORMAL.
 
         It does not stream.
         """
 
         previous_assistant_count = await self.assistant_count()
 
-        print(f"Assistant message count before context: {previous_assistant_count}")
-
-        await self.submit_prompt(context)
+        await self.submit_prompt(
+            context,
+            previous_assistant_count,
+        )
 
         await self.wait_for_response(previous_assistant_count)
 
         self.context_initialized = True
-
-        print("ChatGPT context initialized.")
 
     async def ask(
         self,
@@ -426,7 +456,7 @@ class ChatGPT:
         """
         NORMAL /chat API.
 
-        This NEVER calls stream_response().
+        Returns only after ChatGPT has finished.
         """
 
         if not self.context_initialized:
@@ -434,7 +464,10 @@ class ChatGPT:
 
         previous_assistant_count = await self.assistant_count()
 
-        await self.submit_prompt(prompt)
+        await self.submit_prompt(
+            prompt,
+            previous_assistant_count,
+        )
 
         response = await self.wait_for_response(previous_assistant_count)
 
@@ -447,7 +480,8 @@ class ChatGPT:
         """
         STREAMING /chat/stream API.
 
-        This is the ONLY method that calls stream_response().
+        This is the only method that calls
+        stream_response().
         """
 
         if not self.context_initialized:
@@ -455,7 +489,10 @@ class ChatGPT:
 
         previous_assistant_count = await self.assistant_count()
 
-        await self.submit_prompt(prompt)
+        await self.submit_prompt(
+            prompt,
+            previous_assistant_count,
+        )
 
         async for chunk in self.stream_response(previous_assistant_count):
             yield chunk
