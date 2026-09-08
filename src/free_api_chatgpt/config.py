@@ -1,22 +1,6 @@
 import json
 from pathlib import Path
 
-PROFILE_DIR = "./chatgpt-profile"
-
-HOST = "127.0.0.1"
-PORT = 8000
-
-HEADLESS = True
-
-CHAT_ID: str | None = None
-
-INTERNAL_CONTEXT = ""
-
-RESPONSE_TIMEOUT = 300
-
-RESPONSE_STABLE_SECONDS = 1.5
-
-
 cookies_path = Path("./cookies.json").resolve()
 
 
@@ -67,8 +51,19 @@ def load_cookies() -> list[dict] | None:
 
     return valid_cookies or None
 
+HOST = "127.0.0.1"
+PORT = 8000
+PROFILE_DIR = "./chatgpt-profile"
+HEADLESS = True
+INTERNAL_CONTEXT = ""
+CHAT_ID: str | None = None
 
 COOKIES_JSON = load_cookies()
+
+RESPONSE_TIMEOUT = 120
+POLL_INTERVAL = 0.05
+STABLE_TIME = 1
+FINAL_CHECK_DELAY = 0.15
 
 
 def configure(
