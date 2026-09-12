@@ -2,7 +2,7 @@ import argparse
 
 import uvicorn
 
-from free_api_chatgpt.config import HOST, PORT, configure
+from free_api_chatgpt import config
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,7 +55,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    configure(
+    config.configure(
         host=args.host,
         port=args.port,
         profile_dir=args.profile_dir,
@@ -66,8 +66,8 @@ def main():
 
     uvicorn.run(
         "free_api_chatgpt.api:app",
-        host=HOST,
-        port=PORT,
+        host=config.HOST,
+        port=config.PORT,
         reload=False,
         log_level="info",
     )
